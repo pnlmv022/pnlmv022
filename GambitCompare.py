@@ -3,7 +3,6 @@ import glob
 import io
 import os
 import re
-import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -19,6 +18,7 @@ INC_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_Genera
 ALERT_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\GambitCompare\GambitCompare_Alerts\alert-report*.csv"
 LOOKUP_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\GambitCompare\GambitCompare_HCC\*.csv"
 KEY_FILE = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Key\Oauth2ClientCredentialsToken.txt"
+ALL_STORES_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Data\ALL_Stores.csv"
 
 RUN_DATE_FILE = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Data\OverviewRunDate.csv"
 GET_ALL_STORES_SCRIPT = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Scripts\GetAllStores.py"
@@ -51,11 +51,12 @@ BRAND_REPORT_URLS = {
     "gall":        "https://gambit-dmi-media-devices-gall-prd.kaas.prd.k8s.ah.technology/v1/alerts/report",
 }
 
-# Optional: hardcode AZ path if PATH behaves differently in scheduler/service context.
-# Leave as None to auto-detect with shutil.which("az")
-AZ_CLI_PATH = None
-# Example:
-# AZ_CLI_PATH = r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"
+# Label (as used in ALL_Stores.csv / mismatch export) → store-detail endpoint mapping
+STORE_DETAIL_URLS = {
+    "AH": "https://gambit-dmi-media-devices-albertheijn-prd.kaas.prd.k8s.ah.technology/v1/stores/",
+    "ET": "https://gambit-dmi-media-devices-etos-prd.kaas.prd.k8s.ah.technology/v1/stores/",
+    "GG": "https://gambit-dmi-media-devices-gall-prd.kaas.prd.k8s.ah.technology/v1/stores/",
+}
 
 # ==============================
 # SETUP
@@ -334,6 +335,215 @@ def require_columns(df: pd.DataFrame, required_cols: list, file_label: str):
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise Exception(f"Missing required columns in {file_label}: {missing}")
+
+# ==============================
+# NOTES COLUMN NORMALIZATION
+# ==============================
+
+def normalize_notes_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a single canonical 'Notes' column exists on df.
+
+    Alert reports can contain a 'Notes' column with capital N. If a stray
+    lowercase 'notes' column is also present, merge its values into 'Notes'
+    (preferring any existing 'Notes' value) and drop the duplicate so we
+    never end up with a blank 'Notes' plus a populated lowercase 'notes'.
+    """
+    df = df.copy()
+    has_upper = "Notes" in df.columns
+    has_lower = "notes" in df.columns
+
+    if has_upper and has_lower:
+        upper_is_blank = df["Notes"].isna() | (df["Notes"].astype(str).str.strip() == "")
+        df.loc[upper_is_blank, "Notes"] = df.loc[upper_is_blank, "notes"]
+        df = df.drop(columns=["notes"])
+    elif has_lower and not has_upper:
+        df = df.rename(columns={"notes": "Notes"})
+    elif not has_upper and not has_lower:
+        df["Notes"] = ""
+
+    df["Notes"] = df["Notes"].fillna("")
+    return df
+
+# ==============================
+# STORE HOURS / CLOSED-STORE DETECTION
+# ==============================
+
+def load_all_stores_map(path: str) -> dict:
+    """
+    Load ALL_Stores.csv and build a mapping of (label, store_number) -> internal
+    store id, used to call the brand store-detail API.
+    """
+    mapping = {}
+
+    if not os.path.exists(path):
+        log_error(f"ALL_Stores file not found: {path}")
+        return mapping
+
+    try:
+        df = safe_read_csv(path, sep=None, engine="python")
+    except Exception as e:
+        log_error(f"Failed to read ALL_Stores file '{path}': {e}")
+        return mapping
+
+    df = normalize_columns(df)
+
+    id_col = next((c for c in df.columns if c.lower() == "id"), None)
+    store_col = next(
+        (c for c in df.columns if c.lower() in
+            ["storeid", "store_id", "store_number", "storenumber", "store"]),
+        None
+    )
+    label_col = next(
+        (c for c in df.columns if c.lower() in ["label", "brand"]),
+        None
+    )
+
+    if not id_col or not store_col or not label_col:
+        log_error(f"ALL_Stores file missing required columns. Found: {df.columns.tolist()}")
+        return mapping
+
+    for _, row in df.iterrows():
+        store_number = extract_digits(row.get(store_col, ""))
+        label = clean(row.get(label_col, "")).upper()
+        internal_id = clean(row.get(id_col, ""))
+        if store_number and label and internal_id:
+            mapping[(label, store_number)] = internal_id
+
+    print(f"✅ ALL_Stores entries loaded: {len(mapping)}")
+    return mapping
+
+
+def fetch_store_detail(label: str, internal_id: str, token: str):
+    """GET the store detail JSON from the brand-specific store endpoint."""
+    base = STORE_DETAIL_URLS.get(label)
+    if not base or not internal_id:
+        return None
+
+    url = f"{base}{internal_id}"
+    fetch_headers = {
+        "accept": "application/json",
+        "X-Authorization": token,
+    }
+
+    try:
+        response = requests.get(url, headers=fetch_headers, timeout=REQUEST_TIMEOUT, verify=VERIFY_SSL)
+    except requests.RequestException as e:
+        log_error(f"GET store detail error for {url}: {e}")
+        return None
+    except Exception as e:
+        log_error(f"Unexpected GET store detail error for {url}: {e}")
+        return None
+
+    if response.status_code != 200:
+        log_error(f"Store detail fetch failed for {url}: {response.status_code} - {shorten_text(response.text)}")
+        return None
+
+    try:
+        return response.json()
+    except Exception as e:
+        log_error(f"Failed to parse store detail JSON from {url}: {e}")
+        return None
+
+
+def parse_play_hours_entries(store_detail: dict) -> list:
+    """
+    Extract (date, openTime, closeTime) tuples from effectivePlayHours, sorted
+    by date. playStartTime/playEndTime/playHoursOverrides are intentionally
+    ignored, as closure must be determined only from effectivePlayHours.
+    """
+    entries = []
+    play_hours = store_detail.get("effectivePlayHours") if store_detail else None
+    if not isinstance(play_hours, list):
+        return entries
+
+    for entry in play_hours:
+        if not isinstance(entry, dict):
+            continue
+
+        date_str   = entry.get("date") or entry.get("effectiveDate") or entry.get("day")
+        open_time  = entry.get("openTime")
+        close_time = entry.get("closeTime")
+
+        if not date_str or open_time is None or close_time is None:
+            continue
+
+        parsed_date = None
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                parsed_date = datetime.strptime(str(date_str)[:10], fmt).date()
+                break
+            except ValueError:
+                continue
+
+        if parsed_date is None:
+            continue
+
+        entries.append((parsed_date, str(open_time).strip(), str(close_time).strip()))
+
+    entries.sort(key=lambda e: e[0])
+    return entries
+
+
+def compute_store_status(store_detail: dict, as_of=None):
+    """
+    Determine ('Open' | 'Closed' | 'Unknown', note) for a store, based solely on
+    effectivePlayHours[].openTime / closeTime.
+
+    A store is closed for a date when openTime equals closeTime (including
+    "00:00" to "00:00"). If a future effectivePlayHours entry has different
+    open/close times, the note includes the next opening date/time.
+    """
+    as_of = as_of or datetime.now().date()
+    entries = parse_play_hours_entries(store_detail)
+
+    today_entry = next((e for e in entries if e[0] == as_of), None)
+    if today_entry is None:
+        return "Unknown", ""
+
+    _, open_time, close_time = today_entry
+    if open_time != close_time:
+        return "Open", ""
+
+    future_entry = next(
+        (e for e in entries if e[0] > as_of and e[1] != e[2]),
+        None
+    )
+
+    if future_entry:
+        future_date, future_open, _ = future_entry
+        note = f"Store is closed - opening at {future_date.strftime('%d-%m-%Y')} {future_open}"
+    else:
+        note = "Store is closed"
+
+    return "Closed", note
+
+
+def resolve_store_status_and_note(label: str, store_number: str, stores_map: dict, token: str, status_cache: dict):
+    """
+    Resolve a mismatch row's store status/note using the ALL_Stores.csv mapping
+    plus the brand store-detail API. Results are cached per (label, store_number)
+    to avoid repeat API calls for the same store within a run.
+    """
+    cache_key = (label, store_number)
+    if cache_key in status_cache:
+        return status_cache[cache_key]
+
+    internal_id = stores_map.get(cache_key)
+    if not internal_id:
+        result = ("Unknown", "")
+        status_cache[cache_key] = result
+        return result
+
+    store_detail = fetch_store_detail(label, internal_id, token)
+    if store_detail is None:
+        result = ("Unknown", "")
+        status_cache[cache_key] = result
+        return result
+
+    result = compute_store_status(store_detail)
+    status_cache[cache_key] = result
+    return result
 
 # ==============================
 # RUN-DATE CHECK / GETALLSTORES
@@ -676,15 +886,23 @@ incident_keys    = set(incident_lookup.keys())
 print(f"✅ Unique incident keys: {len(incident_lookup)}")
 
 # ==============================
+# ALL_STORES MAP (for closed-store check)
+# ==============================
+
+all_stores_map     = load_all_stores_map(ALL_STORES_PATH)
+store_status_cache = {}
+
+# ==============================
 # PROCESS ALERT FILES
 # ==============================
 
 all_mismatches = []
 
-total_success    = 0
-total_fail       = 0
-total_matches    = 0
-total_mismatches = 0
+total_success             = 0
+total_fail                = 0
+total_matches             = 0
+total_mismatches          = 0
+total_closed_notes_written = 0
 
 for alert_file in sorted(alert_files, key=os.path.getctime):
     print("\n" + "=" * 80)
@@ -710,6 +928,7 @@ for alert_file in sorted(alert_files, key=os.path.getctime):
         continue
 
     alerts = normalize_columns(alerts)
+    alerts = normalize_notes_column(alerts)
 
     required_alert_cols = ["Status", "Alert_Code", "Location_Info", "Host_Name", "Alert_ID"]
     missing_alert_cols  = [c for c in required_alert_cols if c not in alerts.columns]
@@ -752,9 +971,73 @@ for alert_file in sorted(alert_files, key=os.path.getctime):
 
     if file_mismatches > 0:
         mismatch.insert(0, "Label", label)
+        mismatch = normalize_notes_column(mismatch)
 
-        if "notes" not in mismatch.columns:
-            mismatch["notes"] = ""
+        if "Store_Status" not in mismatch.columns:
+            mismatch["Store_Status"] = "Unknown"
+
+        file_closed_notes_written = 0
+
+        for idx in mismatch.index:
+            store_number = str(mismatch.at[idx, "location"]).strip() if "location" in mismatch.columns else ""
+
+            status, note = resolve_store_status_and_note(
+                label, store_number, all_stores_map, AUTH_TOKEN, store_status_cache
+            )
+            mismatch.at[idx, "Store_Status"] = status
+
+            if status == "Closed" and note:
+                mismatch.at[idx, "Notes"] = note
+                file_closed_notes_written += 1
+
+                alert_id   = str(mismatch.at[idx, "Alert_ID"]).strip() if "Alert_ID" in mismatch.columns else ""
+                alert_mac  = clean_mac(mismatch.at[idx, "Mac_Address"]) if "Mac_Address" in mismatch.columns else ""
+                alert_host = str(mismatch.at[idx, "Host_Name"]).strip() if "Host_Name" in mismatch.columns else ""
+
+                if not alert_id:
+                    log_error_row(
+                        label=label,
+                        store_id=store_number,
+                        mac_address=alert_mac,
+                        hostname=alert_host,
+                        msg="Missing Alert_ID for closed-store mismatch row, cannot update notes via API",
+                    )
+                    continue
+
+                try:
+                    ok, status_code, final_url, response_text = update_alert_notes(
+                        alert_id=alert_id,
+                        notes=note,
+                        headers=headers,
+                        api_base=api_base
+                    )
+                    if ok:
+                        print(f"✅ Closed-store alert {alert_id} notes updated ({status_code}) via {final_url}")
+                    else:
+                        print(f"❌ Closed-store alert {alert_id} notes update failed ({status_code}) via {final_url}")
+                        log_error_row(
+                            label=label,
+                            store_id=store_number,
+                            mac_address=alert_mac,
+                            hostname=alert_host,
+                            msg=(
+                                f"Closed-store alert {alert_id} notes update failed. "
+                                f"status={status_code}, url={final_url}, response={shorten_text(response_text)}"
+                            ),
+                        )
+                except Exception as e:
+                    print(f"❌ Closed-store alert {alert_id} notes update exception: {e}")
+                    log_error_row(
+                        label=label,
+                        store_id=store_number,
+                        mac_address=alert_mac,
+                        hostname=alert_host,
+                        msg=f"Closed-store alert {alert_id} notes update exception: {e}",
+                    )
+
+        if file_closed_notes_written:
+            print(f"📝 Closed-store notes written for this file: {file_closed_notes_written}")
+        total_closed_notes_written += file_closed_notes_written
 
         all_mismatches.append(mismatch)
 
@@ -855,7 +1138,22 @@ try:
     if all_mismatches:
         combined_mismatch = pd.concat(all_mismatches, ignore_index=True)
     else:
-        combined_mismatch = pd.DataFrame(columns=["Label", "notes"])
+        combined_mismatch = pd.DataFrame(columns=["Label", "Notes", "Store_Status"])
+
+    combined_mismatch = normalize_notes_column(combined_mismatch)
+    if "Store_Status" not in combined_mismatch.columns:
+        combined_mismatch["Store_Status"] = "Unknown"
+
+    closed_mask        = combined_mismatch["Store_Status"] == "Closed"
+    closed_count       = int(closed_mask.sum())
+    closed_with_notes  = int((closed_mask & (combined_mismatch["Notes"].astype(str).str.strip() != "")).sum())
+
+    print(f"📝 Closed-store notes written into mismatch export: {total_closed_notes_written}")
+    print(f"📝 Closed rows with non-empty Notes: {closed_with_notes}/{closed_count}")
+    if closed_count and closed_with_notes != closed_count:
+        log_error(
+            f"{closed_count - closed_with_notes} closed-store mismatch row(s) are missing Notes in the export."
+        )
 
     combined_mismatch.to_csv(OUTPUT_FILE, index=False, encoding="utf-8")
     print(f"\n✅ Combined mismatch exported to: {OUTPUT_FILE}")
