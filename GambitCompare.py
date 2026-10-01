@@ -20,8 +20,6 @@ ALERT_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\GambitCompa
 LOOKUP_PATH = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\GambitCompare\GambitCompare_HCC\*.csv"
 KEY_FILE = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Key\Oauth2ClientCredentialsToken.txt"
 
-VWO_DATUM_FILE = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\GambitCompare\GambitCompare_Vwo_datum\Vwo.datum.txt"
-
 RUN_DATE_FILE = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Data\OverviewRunDate.csv"
 GET_ALL_STORES_SCRIPT = r"C:\Users\pnlmv022\OneDrive - AholdDelhaize.com\Gambit\Gambit_General\Gambit_General_Scripts\GetAllStores.py"
 GET_ALL_STORES_NAME = "GetAllStores.py"
@@ -66,7 +64,6 @@ AZ_CLI_PATH = None
 os.makedirs(ALERT_FOLDER, exist_ok=True)
 os.makedirs(ERROR_FOLDER, exist_ok=True)
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-os.makedirs(os.path.dirname(VWO_DATUM_FILE), exist_ok=True)
 
 with open(ERROR_FILE, "w", encoding="utf-8", newline="") as f:
     writer = csv.writer(f)
@@ -148,167 +145,6 @@ def normalize_hostname(value):
 
 def build_incident_key(location_num, hostname):
     return f"{clean(location_num)}{clean(hostname)}"
-
-# ==============================
-# VWO DATUM HELPERS
-# ==============================
-
-def resolve_az_cli():
-    if AZ_CLI_PATH:
-        if os.path.exists(AZ_CLI_PATH):
-            return AZ_CLI_PATH
-        log_error(f"Configured AZ_CLI_PATH does not exist: {AZ_CLI_PATH}")
-        return None
-
-    az_path = shutil.which("az")
-    if az_path:
-        return az_path
-
-    # Extra fallback locations often seen on Windows
-    common_paths = [
-        r"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
-        r"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd",
-    ]
-
-    for p in common_paths:
-        if os.path.exists(p):
-            return p
-
-    return None
-
-def refresh_vwo_datum_file(vwo_file_path: str):
-    """
-    Try to refresh local Vwo.datum copy from remote source.
-    If refresh fails but local file exists, continue safely.
-    Returns True if refreshed, False otherwise.
-    """
-    az_executable = resolve_az_cli()
-
-    if not az_executable:
-        msg = "Azure CLI executable 'az' not found in PATH or fallback locations."
-        if os.path.exists(vwo_file_path):
-            print(f"⚠ {msg} Using existing local Vwo.datum file.")
-            log_error(msg + f" Existing file will be used: {vwo_file_path}")
-            return False
-        print(f"❌ {msg}")
-        log_error(msg)
-        return False
-
-    cmd = [
-        az_executable,
-        "ssh",
-        "vm",
-        "--hostname",
-        "storestepstone.ah.nl",
-        "cat /usr/local/share/groups/application_support/store_atosapp02/dat/in/vwo.datum",
-    ]
-
-    try:
-        print(f"Refreshing Vwo.datum using: {az_executable}")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            encoding="utf-8",
-            errors="ignore",
-            shell=False,
-        )
-
-        if result.returncode != 0:
-            msg = (
-                f"Vwo.datum refresh failed: exit={result.returncode}, "
-                f"stderr={shorten_text(result.stderr)}"
-            )
-            if os.path.exists(vwo_file_path):
-                print("⚠ Refresh failed, using existing local Vwo.datum file")
-                log_error(msg + f" Existing file will be used: {vwo_file_path}")
-                return False
-            print("❌ Refresh failed and no local Vwo.datum file exists")
-            log_error(msg)
-            return False
-
-        stdout_text = result.stdout or ""
-        if not stdout_text.strip():
-            msg = "Vwo.datum refresh returned empty output."
-            if os.path.exists(vwo_file_path):
-                print("⚠ Refresh returned empty output, using existing local Vwo.datum file")
-                log_error(msg + f" Existing file will be used: {vwo_file_path}")
-                return False
-            print("❌ Refresh returned empty output and no local Vwo.datum file exists")
-            log_error(msg)
-            return False
-
-        with open(vwo_file_path, "w", encoding="utf-8", errors="ignore") as f:
-            f.write(stdout_text)
-
-        print(f"✅ Refreshed Vwo.datum → {vwo_file_path}")
-        return True
-
-    except FileNotFoundError as e:
-        msg = f"Exception fetching vwo.datum: {e}"
-        if os.path.exists(vwo_file_path):
-            print(f"⚠ {msg} Using existing local Vwo.datum file.")
-            log_error(msg + f" Existing file will be used: {vwo_file_path}")
-            return False
-        print(f"❌ {msg}")
-        log_error(msg)
-        return False
-
-    except subprocess.TimeoutExpired as e:
-        msg = f"Vwo.datum refresh timeout: {e}"
-        if os.path.exists(vwo_file_path):
-            print("⚠ Refresh timed out, using existing local Vwo.datum file")
-            log_error(msg + f" Existing file will be used: {vwo_file_path}")
-            return False
-        print("❌ Refresh timed out and no local Vwo.datum file exists")
-        log_error(msg)
-        return False
-
-    except Exception as e:
-        msg = f"Exception fetching vwo.datum: {e}"
-        if os.path.exists(vwo_file_path):
-            print(f"⚠ {msg} Using existing local Vwo.datum file.")
-            log_error(msg + f" Existing file will be used: {vwo_file_path}")
-            return False
-        print(f"❌ {msg}")
-        log_error(msg)
-        return False
-
-def load_vwo_lines(vwo_file_path: str):
-    if not os.path.exists(vwo_file_path):
-        log_error(f"Vwo.datum file does not exist: {vwo_file_path}")
-        return []
-
-    try:
-        with open(vwo_file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return [line.rstrip("\n") for line in f if line.strip()]
-    except Exception as e:
-        log_error(f"Could not read Vwo.datum file: {e}")
-        return []
-
-def is_empty_notes(value):
-    return pd.isna(value) or str(value).strip() == ""
-
-def store_in_line_exact(store: str, line: str) -> bool:
-    if not store or not line:
-        return False
-    pattern = rf"(?<!\d){re.escape(str(store))}(?!\d)"
-    return re.search(pattern, line) is not None
-
-def find_vwo_notes(store, vwo_lines):
-    store = str(store).strip()
-    if not store:
-        return ""
-
-    for line in vwo_lines:
-        if "real opening" not in line.lower():
-            continue
-        if store_in_line_exact(store, line):
-            return line.strip()
-
-    return ""
 
 # ==============================
 # BRAND / API BASE / LABEL
@@ -734,18 +570,6 @@ if not fetched_files:
 print(f"\n✅ Fetched {len(fetched_files)} alert report file(s).")
 
 # ==============================
-# REFRESH / LOAD VWO DATUM
-# ==============================
-
-refresh_vwo_datum_file(VWO_DATUM_FILE)
-vwo_lines = load_vwo_lines(VWO_DATUM_FILE)
-
-if vwo_lines:
-    print(f"✅ Loaded {len(vwo_lines)} Vwo.datum lines")
-else:
-    print("⚠ No Vwo.datum lines loaded")
-
-# ==============================
 # LOAD FILES
 # ==============================
 
@@ -932,19 +756,6 @@ for alert_file in sorted(alert_files, key=os.path.getctime):
         if "notes" not in mismatch.columns:
             mismatch["notes"] = ""
 
-        def fill_notes_from_vwo(row):
-            current_notes = row.get("notes", "")
-            if not is_empty_notes(current_notes):
-                return current_notes
-
-            store = clean(row.get("store", ""))
-            if not store:
-                return current_notes
-
-            vwo_note = find_vwo_notes(store, vwo_lines)
-            return vwo_note if vwo_note else current_notes
-
-        mismatch["notes"] = mismatch.apply(fill_notes_from_vwo, axis=1)
         all_mismatches.append(mismatch)
 
     print("Updating alerts via API...")
