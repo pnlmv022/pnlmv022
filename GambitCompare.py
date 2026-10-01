@@ -58,6 +58,19 @@ STORE_DETAIL_URLS = {
     "GG": "https://gambit-dmi-media-devices-gall-prd.kaas.prd.k8s.ah.technology/v1/stores/",
 }
 
+# ALL_Stores.csv banner / brand value (upper-cased) → label
+BANNER_ALIASES = {
+    "ALBERT HEIJN": "AH",
+    "ALBERTHEIJN":  "AH",
+    "AH":           "AH",
+    "ETOS":         "ET",
+    "ET":           "ET",
+    "GALL & GALL":  "GG",
+    "GALL&GALL":    "GG",
+    "GALL":         "GG",
+    "GG":           "GG",
+}
+
 # ==============================
 # SETUP
 # ==============================
@@ -395,7 +408,7 @@ def load_all_stores_map(path: str) -> dict:
         None
     )
     label_col = next(
-        (c for c in df.columns if c.lower() in ["label", "brand"]),
+        (c for c in df.columns if c.lower() in ["label", "brand", "banner"]),
         None
     )
 
@@ -405,12 +418,15 @@ def load_all_stores_map(path: str) -> dict:
 
     for _, row in df.iterrows():
         store_number = extract_digits(row.get(store_col, ""))
-        label = clean(row.get(label_col, "")).upper()
+        banner = re.sub(r"\s+", " ", clean(row.get(label_col, "")).upper())
+        label = BANNER_ALIASES.get(banner, banner)
         internal_id = clean(row.get(id_col, ""))
         if store_number and label and internal_id:
             mapping[(label, store_number)] = internal_id
 
-    print(f"✅ ALL_Stores entries loaded: {len(mapping)}")
+    print(f"✅ Store ID entries: {len(mapping)}")
+    if not mapping:
+        log_error(f"ALL_Stores file '{path}' loaded 0 store ID entries (label column: '{label_col}')")
     return mapping
 
 
@@ -446,6 +462,68 @@ def fetch_store_detail(label: str, internal_id: str, token: str):
         return None
 
 
+def parse_play_hours_date(value):
+    """
+    Parse an effectivePlayHours date. Supports nested objects such as
+    {"year": 2026, "month": 10, "day": 1} and falls back to ISO strings
+    ("YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS[Z]").
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        try:
+            return datetime(int(value["year"]), int(value["month"]), int(value["day"])).date()
+        except (KeyError, TypeError, ValueError):
+            pass
+        # Fall back to a string representation nested in the object, if any
+        value = value.get("date") or value.get("value") or ""
+
+    # Only ISO (year-first) formats are accepted: the brand store API
+    # returns ISO 8601 dates, and day-first formats would be ambiguous
+    # for dates where both day and month are <= 12 (e.g. "03-04-2026").
+    raw_date = str(value).strip()
+    date_part = raw_date.split("T", 1)[0].split(" ", 1)[0]
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(date_part, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def parse_play_hours_time(value):
+    """
+    Parse an effectivePlayHours open/close time into "HH:MM". Supports nested
+    objects such as {"hour": 0, "minute": 0} and falls back to strings like
+    "06:00" or "06:00:00".
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        try:
+            hour = int(value["hour"])
+            minute = int(value.get("minute") or 0)
+            if 0 <= minute <= 59 and (0 <= hour <= 23 or (hour == 24 and minute == 0)):
+                return f"{hour:02d}:{minute:02d}"
+        except (KeyError, TypeError, ValueError):
+            pass
+        value = value.get("time") or value.get("value")
+        if value is None:
+            return None
+
+    raw_time = str(value).strip()
+    if not raw_time:
+        return None
+
+    m = re.match(r"^(\d{1,2}):(\d{2})", raw_time)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return None
+
+
 def parse_play_hours_entries(store_detail: dict) -> list:
     """
     Extract (date, openTime, closeTime) tuples from effectivePlayHours, sorted
@@ -461,33 +539,18 @@ def parse_play_hours_entries(store_detail: dict) -> list:
         if not isinstance(entry, dict):
             continue
 
-        date_str   = entry.get("date") or entry.get("effectiveDate") or entry.get("day")
-        open_time  = entry.get("openTime")
-        close_time = entry.get("closeTime")
+        # Dates may arrive as a nested {"year", "month", "day"} object, a plain
+        # "YYYY-MM-DD" string or an ISO timestamp; times may arrive as nested
+        # {"hour", "minute"} objects or "HH:MM" strings.
+        raw_date    = entry.get("date") or entry.get("effectiveDate") or entry.get("day")
+        parsed_date = parse_play_hours_date(raw_date)
+        open_time   = parse_play_hours_time(entry.get("openTime"))
+        close_time  = parse_play_hours_time(entry.get("closeTime"))
 
-        if not date_str or open_time is None or close_time is None:
+        if parsed_date is None or open_time is None or close_time is None:
             continue
 
-        # Dates may arrive as a plain "YYYY-MM-DD" or as an ISO timestamp
-        # ("YYYY-MM-DDTHH:MM:SS[Z]"); only the date portion is relevant here.
-        # Only ISO (year-first) formats are accepted: the brand store API
-        # returns ISO 8601 dates, and day-first formats would be ambiguous
-        # for dates where both day and month are <= 12 (e.g. "03-04-2026").
-        raw_date = str(date_str).strip()
-        date_part = raw_date.split("T", 1)[0].split(" ", 1)[0]
-
-        parsed_date = None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-            try:
-                parsed_date = datetime.strptime(date_part, fmt).date()
-                break
-            except ValueError:
-                continue
-
-        if parsed_date is None:
-            continue
-
-        entries.append((parsed_date, str(open_time).strip(), str(close_time).strip()))
+        entries.append((parsed_date, open_time, close_time))
 
     entries.sort(key=lambda e: e[0])
     return entries
