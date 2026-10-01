@@ -506,7 +506,7 @@ def parse_play_hours_time(value):
         try:
             hour = int(value["hour"])
             minute = int(value.get("minute") or 0)
-            if 0 <= hour <= 24 and 0 <= minute <= 59:
+            if 0 <= minute <= 59 and (0 <= hour <= 23 or (hour == 24 and minute == 0)):
                 return f"{hour:02d}:{minute:02d}"
         except (KeyError, TypeError, ValueError):
             pass
@@ -521,7 +521,7 @@ def parse_play_hours_time(value):
     m = re.match(r"^(\d{1,2}):(\d{2})", raw_time)
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
-    return raw_time
+    return None
 
 
 def parse_play_hours_entries(store_detail: dict) -> list:
