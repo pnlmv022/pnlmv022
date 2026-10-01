@@ -470,11 +470,14 @@ def parse_play_hours_entries(store_detail: dict) -> list:
 
         # Dates may arrive as a plain "YYYY-MM-DD" or as an ISO timestamp
         # ("YYYY-MM-DDTHH:MM:SS[Z]"); only the date portion is relevant here.
+        # Only ISO (year-first) formats are accepted: the brand store API
+        # returns ISO 8601 dates, and day-first formats would be ambiguous
+        # for dates where both day and month are <= 12 (e.g. "03-04-2026").
         raw_date = str(date_str).strip()
         date_part = raw_date.split("T", 1)[0].split(" ", 1)[0]
 
         parsed_date = None
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y"):
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
             try:
                 parsed_date = datetime.strptime(date_part, fmt).date()
                 break
@@ -534,6 +537,9 @@ def resolve_store_status_and_note(label: str, store_number: str, stores_map: dic
     Resolve a mismatch row's store status/note using the ALL_Stores.csv mapping
     plus the brand store-detail API. Results are cached per (label, store_number)
     to avoid repeat API calls for the same store within a run.
+
+    This script runs single-threaded; status_cache is a plain dict with no
+    locking and must not be shared across concurrent threads/processes.
     """
     cache_key = (label, store_number)
     if cache_key in status_cache:
