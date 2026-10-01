@@ -468,10 +468,15 @@ def parse_play_hours_entries(store_detail: dict) -> list:
         if not date_str or open_time is None or close_time is None:
             continue
 
+        # Dates may arrive as a plain "YYYY-MM-DD" or as an ISO timestamp
+        # ("YYYY-MM-DDTHH:MM:SS[Z]"); only the date portion is relevant here.
+        raw_date = str(date_str).strip()
+        date_part = raw_date.split("T", 1)[0].split(" ", 1)[0]
+
         parsed_date = None
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%d/%m/%Y"):
             try:
-                parsed_date = datetime.strptime(str(date_str)[:10], fmt).date()
+                parsed_date = datetime.strptime(date_part, fmt).date()
                 break
             except ValueError:
                 continue
@@ -497,6 +502,11 @@ def compute_store_status(store_detail: dict, as_of=None):
     as_of = as_of or datetime.now().date()
     entries = parse_play_hours_entries(store_detail)
 
+    # Per spec, closure is determined only from today's effectivePlayHours
+    # entry. If the API did not return an entry dated today (e.g. the store
+    # or the list itself is missing/stale), we deliberately report "Unknown"
+    # rather than inferring from other dates, since no other field is
+    # authoritative for "is the store open right now".
     today_entry = next((e for e in entries if e[0] == as_of), None)
     if today_entry is None:
         return "Unknown", ""
@@ -979,7 +989,17 @@ for alert_file in sorted(alert_files, key=os.path.getctime):
         file_closed_notes_written = 0
 
         for idx in mismatch.index:
-            store_number = str(mismatch.at[idx, "location"]).strip() if "location" in mismatch.columns else ""
+            # "location" is the first-4-digits store number derived from
+            # Location_Info a few lines above (alerts["location"] = ...),
+            # carried over into `mismatch` since it is a .copy() of `alerts`.
+            # Fall back to recomputing it from Location_Info directly in case
+            # that column is ever renamed/removed upstream.
+            if "location" in mismatch.columns:
+                store_number = str(mismatch.at[idx, "location"]).strip()
+            elif "Location_Info" in mismatch.columns:
+                store_number = extract_first4_digits(mismatch.at[idx, "Location_Info"])
+            else:
+                store_number = ""
 
             status, note = resolve_store_status_and_note(
                 label, store_number, all_stores_map, AUTH_TOKEN, store_status_cache
